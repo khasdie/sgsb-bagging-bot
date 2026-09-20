@@ -2,7 +2,6 @@ import os
 import re
 import json
 import time
-import queue
 import threading
 import requests
 from flask import Flask, request, jsonify
@@ -20,7 +19,7 @@ API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TZ = ZoneInfo("Asia/Kuala_Lumpur")
 
 # ============================================================
-# SGSB BAGGING BOT V2
+# SGSB BAGGING BOT V3
 # 1 seal = 1 photo + 1 video
 # Staff can submit and immediately start the next record.
 # Archive copying runs through a background queue.
@@ -32,7 +31,6 @@ OUTLETS = list(DEFAULT_OUTLETS)
 sessions = {}
 admin_sessions = {}
 processed_updates = {}
-archive_queue = queue.Queue()
 state_lock = threading.RLock()
 
 # Render free filesystem/RAM is not permanent.
@@ -155,16 +153,9 @@ def outlet_keyboard():
 
 
 def media_keyboard(session=None):
-    photo_ok = bool(session and session.get("photo"))
-    video_ok = bool(session and session.get("video"))
-
     return {
         "inline_keyboard": [
             [{"text": "📝 Remark", "callback_data": "remark"}],
-            [{
-                "text": "✅ SUBMIT" if (photo_ok and video_ok) else "⏳ SUBMIT (belum lengkap)",
-                "callback_data": "submit"
-            }],
             [{"text": "❌ Batal", "callback_data": "cancel"}]
         ]
     }
@@ -312,6 +303,13 @@ def handle_admin_text(chat_id, user_id, text):
     return False
 
 
+def auto_complete_if_ready(chat_id, user, session):
+    if session.get("photo") and session.get("video"):
+        submit_record(chat_id, user, session)
+        return True
+    return False
+
+
 # ============================================================
 # STAFF MESSAGE HANDLER
 # ============================================================
@@ -341,7 +339,7 @@ def handle_message(message):
     if not session:
         send_message(
             chat_id,
-            "👋 <b>SGSB Bagging Bot V2</b>\n\n"
+            "👋 <b>SGSB Bagging Bot V3</b>\n\n"
             "Tekan /start untuk rekod baru.\n"
             "Admin: /admin"
         )
@@ -403,9 +401,11 @@ def handle_message(message):
             "message_id": message["message_id"]
         }
 
+        if auto_complete_if_ready(chat_id, user, session):
+            return
         send_message(
             chat_id,
-            f"📷 <b>Gambar diterima</b>\n\n{media_status(session)}",
+            f"📷 <b>Gambar diterima</b>\n\n{media_status(session)}\n\n⏳ Menunggu 1 video bagging...",
             media_keyboard(session)
         )
         return
@@ -427,9 +427,11 @@ def handle_message(message):
             "kind": "video"
         }
 
+        if auto_complete_if_ready(chat_id, user, session):
+            return
         send_message(
             chat_id,
-            f"🎥 <b>Video diterima</b>\n\n{media_status(session)}",
+            f"🎥 <b>Video diterima</b>\n\n{media_status(session)}\n\n⏳ Menunggu 1 gambar seal...",
             media_keyboard(session)
         )
         return
@@ -454,9 +456,11 @@ def handle_message(message):
                 "kind": "document"
             }
 
+            if auto_complete_if_ready(chat_id, user, session):
+                return
             send_message(
                 chat_id,
-                f"🎥 <b>Video/File diterima</b>\n\n{media_status(session)}",
+                f"🎥 <b>Video/File diterima</b>\n\n{media_status(session)}\n\n⏳ Menunggu 1 gambar seal...",
                 media_keyboard(session)
             )
             return
@@ -587,172 +591,104 @@ def handle_callback(callback):
         )
         return
 
+    if data == "retry_archive":
+        if session.get("photo") and session.get("video"):
+            submit_record(chat_id, user, session)
+        return
+
+    # Compatibility for old SUBMIT buttons already visible in Telegram.
     if data == "submit":
-        submit_record(chat_id, user, session)
+        if session.get("photo") and session.get("video"):
+            submit_record(chat_id, user, session)
+        else:
+            send_message(chat_id, "⚠️ Rekod belum lengkap.")
         return
 
 
 # ============================================================
-# SUBMIT + ASYNC ARCHIVE QUEUE
+# AUTO SUBMIT + CONFIRMED ARCHIVE
 # ============================================================
 
 def submit_record(chat_id, user, session):
-    if not session.get("outlet"):
-        send_message(chat_id, "⚠️ Outlet belum dipilih.")
+    if not session.get("outlet") or not session.get("seal"):
         return
-
-    if not session.get("seal"):
-        send_message(chat_id, "⚠️ Seal belum dimasukkan.")
-        return
-
-    if not session.get("photo"):
-        send_message(
-            chat_id,
-            "⚠️ <b>1 gambar seal</b> diperlukan.",
-            media_keyboard(session)
-        )
-        return
-
-    if not session.get("video"):
-        send_message(
-            chat_id,
-            "⚠️ <b>1 video bagging</b> diperlukan.",
-            media_keyboard(session)
-        )
+    if not session.get("photo") or not session.get("video"):
         return
 
     submitted_at = now_my()
     username = user.get("username")
     first_name = user.get("first_name", "Staff")
     submitted_by = f"{first_name} (@{username})" if username else first_name
-
     record_id = f"{session['outlet']}-{submitted_at.strftime('%Y%m%d-%H%M%S')}"
 
     job = {
-        "record_id": record_id,
-        "outlet": session["outlet"],
-        "seal": session["seal"],
-        "photo": dict(session["photo"]),
-        "video": dict(session["video"]),
-        "remark": session.get("remark") or "-",
-        "submitted_by": submitted_by,
-        "submitted_at": submitted_at.isoformat(),
-        "staff_chat_id": chat_id
+        "record_id": record_id, "outlet": session["outlet"], "seal": session["seal"],
+        "photo": dict(session["photo"]), "video": dict(session["video"]),
+        "remark": session.get("remark") or "-", "submitted_by": submitted_by,
+        "submitted_at": submitted_at.isoformat(), "staff_chat_id": chat_id
     }
+    session["step"] = "archiving"
 
-    # Queue first, then immediately release the staff session.
-    archive_queue.put(job)
+    send_message(chat_id,
+        "✅ <b>GAMBAR & VIDEO LENGKAP</b>\n\n"
+        f"🏢 <b>{safe_html(job['outlet'])}</b>\n"
+        f"🔒 <b>{safe_html(job['seal'])}</b>\n\n"
+        "📤 Menghantar rekod ke Archive...")
+
+    ok, error = process_archive_job(job)
+    if not ok:
+        session["step"] = "archive_failed"
+        send_message(chat_id,
+            "⚠️ <b>ARCHIVE GAGAL</b>\n\n"
+            f"🆔 <code>{safe_html(record_id)}</code>\n"
+            "Media asal masih selamat dalam chat Telegram.\n"
+            "Tekan <b>CUBA ARCHIVE SEMULA</b>.",
+            {"inline_keyboard":[
+                [{"text":"🔄 CUBA ARCHIVE SEMULA","callback_data":"retry_archive"}],
+                [{"text":"❌ Batal","callback_data":"cancel"}]
+            ]})
+        print("Archive failed:", error, flush=True)
+        return
+
     with state_lock:
         sessions.pop(user["id"], None)
 
-    send_message(
-        chat_id,
-        "✅ <b>SUBMISSION DITERIMA</b>\n\n"
+    send_message(chat_id,
+        "✅ <b>BAGGING SELESAI & ARCHIVE BERJAYA</b>\n\n"
         f"🆔 <code>{safe_html(record_id)}</code>\n"
         f"🏢 <b>{safe_html(job['outlet'])}</b>\n"
         f"🔒 <b>{safe_html(job['seal'])}</b>\n"
-        "📷 Gambar: ✅\n"
-        "🎥 Video: ✅\n\n"
-        "📤 Archive sedang diproses di belakang.\n"
+        "📷 Gambar: ✅\n🎥 Video: ✅\n🗄 Archive: ✅\n\n"
         "Anda boleh terus buat bagging seterusnya.",
-        new_record_keyboard()
-    )
-
-
-def archive_worker():
-    while True:
-        job = archive_queue.get()
-        try:
-            process_archive_job(job)
-        except Exception as e:
-            print("Archive worker error:", e, flush=True)
-            try:
-                send_message(
-                    job.get("staff_chat_id"),
-                    "⚠️ <b>ARCHIVE GAGAL</b>\n\n"
-                    f"Record: <code>{safe_html(job.get('record_id'))}</code>\n"
-                    "Media asal masih berada dalam chat Telegram.\n"
-                    "Sila maklumkan admin."
-                )
-            except Exception:
-                pass
-        finally:
-            archive_queue.task_done()
+        new_record_keyboard())
 
 
 def process_archive_job(job):
     submitted_at = datetime.fromisoformat(job["submitted_at"]).astimezone(TZ)
-    outlet_tag = hashtag(job["outlet"])
-    seal_tag = hashtag(job["seal"])
-    date_tag = submitted_at.strftime("%Y%m%d")
-
-    # Archive Format V2:
-    # 1 compact record card + photo + video.
-    # The large video is copied server-side inside Telegram; Render does not download it.
     header = (
-        "📦 <b>BAGGING RECORD</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
+        "📦 <b>BAGGING RECORD</b>\n━━━━━━━━━━━━━━━━━━\n"
         f"🆔 <code>{safe_html(job['record_id'])}</code>\n"
         f"🏢 <b>{safe_html(job['outlet'])}</b>\n"
         f"🔒 <b>{safe_html(job['seal'])}</b>\n"
         f"🕒 {submitted_at.strftime('%d/%m/%Y • %I:%M %p')}\n"
         f"👤 {safe_html(job['submitted_by'])}\n"
         f"📝 {safe_html(job['remark'])}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📷 1 Photo  •  🎥 1 Video\n\n"
-        f"#{outlet_tag} #{date_tag} #SEAL_{seal_tag}"
+        "━━━━━━━━━━━━━━━━━━\n📷 1 Photo  •  🎥 1 Video\n\n"
+        f"#{hashtag(job['outlet'])} #{submitted_at.strftime('%Y%m%d')} #SEAL_{hashtag(job['seal'])}"
     )
+    r=send_message(ARCHIVE_CHAT_ID, header)
+    if not r.get("ok"): return False, f"header: {r}"
 
-    result = send_message(ARCHIVE_CHAT_ID, header)
-    if not result.get("ok"):
-        raise RuntimeError(f"Archive header failed: {result}")
+    r=copy_message(job["photo"]["chat_id"], job["photo"]["message_id"],
+        f"📷 <b>SEAL PHOTO</b> • {safe_html(job['outlet'])} • {safe_html(job['seal'])}\n"
+        f"<code>{safe_html(job['record_id'])}</code>")
+    if not r.get("ok"): return False, f"photo: {r}"
 
-    photo_caption = (
-        f"📷 <b>SEAL PHOTO</b> • {safe_html(job['outlet'])} • "
-        f"{safe_html(job['seal'])}\n"
-        f"<code>{safe_html(job['record_id'])}</code>"
-    )
-    photo_result = copy_message(
-        job["photo"]["chat_id"],
-        job["photo"]["message_id"],
-        photo_caption
-    )
-    if not photo_result.get("ok"):
-        raise RuntimeError(f"Photo copy failed: {photo_result}")
-
-    video_caption = (
-        f"🎥 <b>BAGGING VIDEO</b> • {safe_html(job['outlet'])} • "
-        f"{safe_html(job['seal'])}\n"
-        f"<code>{safe_html(job['record_id'])}</code>"
-    )
-    video_result = copy_message(
-        job["video"]["chat_id"],
-        job["video"]["message_id"],
-        video_caption
-    )
-    if not video_result.get("ok"):
-        raise RuntimeError(f"Video copy failed: {video_result}")
-
-
-# ============================================================
-# WORKER STARTUP
-# ============================================================
-
-_worker_started = False
-_worker_lock = threading.Lock()
-
-
-def ensure_worker():
-    global _worker_started
-    with _worker_lock:
-        if _worker_started:
-            return
-        t = threading.Thread(target=archive_worker, daemon=True, name="archive-worker")
-        t.start()
-        _worker_started = True
-
-
-ensure_worker()
+    r=copy_message(job["video"]["chat_id"], job["video"]["message_id"],
+        f"🎥 <b>BAGGING VIDEO</b> • {safe_html(job['outlet'])} • {safe_html(job['seal'])}\n"
+        f"<code>{safe_html(job['record_id'])}</code>")
+    if not r.get("ok"): return False, f"video: {r}"
+    return True, None
 
 
 # ============================================================
@@ -763,8 +699,7 @@ ensure_worker()
 def home():
     return jsonify({
         "status": "ok",
-        "service": "SGSB Bagging Bot V2",
-        "queue": archive_queue.qsize(),
+        "service": "SGSB Bagging Bot V3",
         "outlets": len(OUTLETS)
     })
 
