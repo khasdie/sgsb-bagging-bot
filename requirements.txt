@@ -1,3 +1,6 @@
-Flask
-requests
-gunicorn
+Flask>=3.0,<4
+requests>=2.31,<3
+gunicorn>=21,<24
+openpyxl>=3.1,<4
+reportlab>=4.2,<5
+Pillow>=10,<12
