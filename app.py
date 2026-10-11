@@ -14,13 +14,14 @@ from pathlib import Path
 import requests
 from flask import Flask, request, jsonify
 from zoneinfo import ZoneInfo
+import storage_v5_1 as db
 
 app = Flask(__name__)
 
 # ============================================================
-# SGSB BAGGING BOT V5
-# - Permanent Outlet Master (GitHub Gist)
-# - Persistent bagging metadata (monthly JSON files in same Gist)
+# SGSB BAGGING BOT V5.1
+# - Permanent Outlet Master (Supabase)
+# - Persistent bagging metadata and staff sessions (Supabase)
 # - Multiple/parallel Record Cards
 # - 1 Seal = 1 Photo + 1 Video
 # - Telegram album archive (photo + video grouped together)
@@ -36,12 +37,7 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ARCHIVE_CHAT_ID = os.environ.get("ARCHIVE_CHAT_ID", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-ADMIN_PASSCODE = os.environ.get("ADMIN_PASSCODE", "88888888")
-
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-OUTLET_GIST_ID = os.environ.get("OUTLET_GIST_ID", "")
-OUTLET_GIST_FILENAME = os.environ.get("OUTLET_GIST_FILENAME", "sgsb_outlets.json")
-RECORD_GIST_PREFIX = os.environ.get("RECORD_GIST_PREFIX", "sgsb_records_")
+ADMIN_PASSCODE = os.environ.get("ADMIN_PASSCODE", "")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TZ = ZoneInfo("Asia/Kuala_Lumpur")
@@ -60,11 +56,11 @@ DEFAULT_OUTLETS = [
 # RUNTIME STATE
 # ============================================================
 
-records = {}          # rid -> active/recent record cache
-builders = {}         # user_id -> builder state
-input_modes = {}      # user_id -> remark input state
-admin_sessions = {}   # user_id -> admin auth state
-report_sessions = {}  # user_id -> report query state
+records = db.RecordMap()          # rid -> active/recent record cache
+builders = db.SessionMap("builder")         # user_id -> builder state
+input_modes = db.SessionMap("input")      # user_id -> remark input state
+admin_sessions = db.SessionMap("admin")   # user_id -> admin auth state
+report_sessions = db.SessionMap("report")  # user_id -> report query state
 processed_updates = {}
 
 state_lock = threading.RLock()
@@ -191,21 +187,7 @@ def months_between(start_date, end_date):
 
 
 def cleanup_old_runtime_records(max_age_hours=72):
-    cutoff = now_my() - timedelta(hours=max_age_hours)
-    with state_lock:
-        remove = []
-        for rid, record in records.items():
-            if not record.get("archived"):
-                continue
-            stamp = record.get("archived_at") or record.get("completed_at") or record.get("created_at")
-            try:
-                dt = datetime.fromisoformat(stamp).astimezone(TZ)
-            except Exception:
-                continue
-            if dt < cutoff:
-                remove.append(rid)
-        for rid in remove:
-            records.pop(rid, None)
+    pass  # Supabase remains authoritative; never delete permanent records here.
 
 # ============================================================
 # TELEGRAM HELPERS
@@ -229,8 +211,8 @@ def telegram(method, payload=None, timeout=30):
                 "description": f"Non-JSON Telegram response HTTP {response.status_code}"
             }
     except Exception as e:
-        print("Telegram API error:", method, e, flush=True)
-        return {"ok": False, "description": str(e)}
+        print("Telegram API network error:", method, type(e).__name__, flush=True)
+        return {"ok": False, "ambiguous": True, "description": "Telegram sementara tidak tersedia. Sila cuba semula."}
 
 
 def send_message(chat_id, text, keyboard=None):
@@ -302,8 +284,8 @@ def send_document_file(chat_id, filepath, caption=""):
             )
         return response.json()
     except Exception as e:
-        print("sendDocument error:", e, flush=True)
-        return {"ok": False, "description": str(e)}
+        print("sendDocument error:", type(e).__name__, flush=True)
+        return {"ok": False, "ambiguous": True, "description": "Telegram sementara tidak tersedia. Sila cuba semula."}
 
 
 def send_photo_file(chat_id, filepath, caption=""):
@@ -320,8 +302,8 @@ def send_photo_file(chat_id, filepath, caption=""):
             )
         return response.json()
     except Exception as e:
-        print("sendPhoto error:", e, flush=True)
-        return {"ok": False, "description": str(e)}
+        print("sendPhoto error:", type(e).__name__, flush=True)
+        return {"ok": False, "ambiguous": True, "description": "Telegram sementara tidak tersedia. Sila cuba semula."}
 
 
 def send_long_plain(chat_id, text, chunk_size=3500):
@@ -345,358 +327,59 @@ def send_long_plain(chat_id, text, chunk_size=3500):
         send_plain_message(chat_id, prefix + part)
 
 # ============================================================
-# GITHUB GIST STORAGE
+# SUPABASE STORAGE
 # ============================================================
 
-def gist_headers():
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "SGSB-Bagging-Bot"
-    }
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-    return headers
-
-
 def storage_configured():
-    return bool(GITHUB_TOKEN and OUTLET_GIST_ID)
+    return bool(os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_SECRET_KEY"))
 
 
-def get_gist_snapshot():
-    if not storage_configured():
-        raise RuntimeError("GITHUB_TOKEN / OUTLET_GIST_ID belum dikonfigurasi")
-
-    response = requests.get(
-        f"https://api.github.com/gists/{OUTLET_GIST_ID}",
-        headers=gist_headers(),
-        timeout=20
-    )
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"GitHub Gist HTTP {response.status_code}: {response.text[:300]}"
-        )
-    return response.json()
-
-
-def gist_file_content_from_snapshot(snapshot, filename):
-    file_info = snapshot.get("files", {}).get(filename)
-    if not file_info:
-        return None
-
-    if not file_info.get("truncated"):
-        return file_info.get("content", "")
-
-    raw_url = file_info.get("raw_url")
-    if not raw_url:
-        raise RuntimeError(f"raw_url missing for {filename}")
-
-    response = requests.get(
-        raw_url,
-        headers=gist_headers(),
-        timeout=30
-    )
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"GitHub raw Gist HTTP {response.status_code}: {response.text[:300]}"
-        )
-    return response.text
-
-
-def patch_gist_file(filename, content):
-    if not storage_configured():
-        return False, "Permanent Storage belum disambung"
-
-    payload = {
-        "files": {
-            filename: {
-                "content": content
-            }
-        }
-    }
-
-    try:
-        response = requests.patch(
-            f"https://api.github.com/gists/{OUTLET_GIST_ID}",
-            headers=gist_headers(),
-            json=payload,
-            timeout=30
-        )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"GitHub Gist HTTP {response.status_code}: {response.text[:300]}"
-            )
-        return True, None
-    except Exception as e:
-        print("Gist patch error:", filename, e, flush=True)
-        return False, str(e)
-
-
-def load_outlets_from_gist():
+def load_outlets_from_supabase():
     global OUTLETS, OUTLET_STORAGE_OK, OUTLET_STORAGE_ERROR
-
-    if not storage_configured():
-        OUTLETS = list(DEFAULT_OUTLETS)
-        OUTLET_STORAGE_OK = False
-        OUTLET_STORAGE_ERROR = "GITHUB_TOKEN / OUTLET_GIST_ID belum dikonfigurasi"
-        return False
-
     try:
-        snapshot = get_gist_snapshot()
-        content = gist_file_content_from_snapshot(snapshot, OUTLET_GIST_FILENAME)
-        if content is None:
-            raise RuntimeError(f"{OUTLET_GIST_FILENAME} tidak dijumpai")
-
-        data = json.loads(content)
-        clean = []
-        for item in data.get("outlets", []):
-            outlet = normalize_outlet(str(item))
-            if outlet and outlet not in clean:
-                clean.append(outlet)
-
-        if not clean:
-            clean = list(DEFAULT_OUTLETS)
-
-        with state_lock:
-            OUTLETS = sorted(clean)
-
+        data = db.api('sgsb_outlets', params={'active':'eq.true','select':'code','order':'code.asc'})
+        OUTLETS = [r['code'] for r in data]
         OUTLET_STORAGE_OK = True
-        OUTLET_STORAGE_ERROR = ""
-        print(f"Outlet Master loaded: {len(OUTLETS)} outlets", flush=True)
+        OUTLET_STORAGE_ERROR = ''
         return True
-
-    except Exception as e:
-        OUTLETS = list(DEFAULT_OUTLETS)
+    except db.StorageError:
+        OUTLETS = []
         OUTLET_STORAGE_OK = False
-        OUTLET_STORAGE_ERROR = str(e)
-        print("Outlet storage load error:", e, flush=True)
+        OUTLET_STORAGE_ERROR = db.FRIENDLY
         return False
 
 
-def save_outlets_to_gist(outlets):
-    global OUTLET_STORAGE_OK, OUTLET_STORAGE_ERROR
-
-    data = {
-        "version": 2,
-        "updated_at": now_my().isoformat(),
-        "outlets": sorted(outlets)
-    }
-
-    ok, error = patch_gist_file(
-        OUTLET_GIST_FILENAME,
-        json.dumps(data, ensure_ascii=False, indent=2)
-    )
-
-    OUTLET_STORAGE_OK = ok
-    OUTLET_STORAGE_ERROR = "" if ok else str(error)
-    return ok, error
-
-
-def record_filename_for_date(bagging_date):
-    d = date.fromisoformat(str(bagging_date))
-    return f"{RECORD_GIST_PREFIX}{d.strftime('%Y%m')}.json"
+def save_outlets_to_supabase(outlets):
+    db.rpc('sgsb_set_outlets', {'p_codes':sorted(outlets)})
+    return True, None
 
 
 def normalize_record_for_storage(record):
-    allowed = {
-        "rid", "owner_id", "chat_id", "outlet", "seal", "bagging_date",
-        "entry_mode", "late_reason", "photo", "video", "remark",
-        "card_message_id", "created_at", "completed_at", "archived_at",
-        "archived", "archive_failed", "archiving", "status", "cancelled_at"
-    }
-    data = {k: record.get(k) for k in allowed if k in record}
-    data["archiving"] = False
-    return data
-
-
-def parse_record_file(content):
-    if not content:
-        return []
-    data = json.loads(content)
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        return data.get("records", [])
-    return []
-
-
-def load_month_records(month_key, snapshot=None):
-    filename = f"{RECORD_GIST_PREFIX}{month_key}.json"
-    try:
-        if snapshot is None:
-            snapshot = get_gist_snapshot()
-        content = gist_file_content_from_snapshot(snapshot, filename)
-        if content is None:
-            return []
-        rows = parse_record_file(content)
-        return [r for r in rows if isinstance(r, dict)]
-    except Exception as e:
-        print("load_month_records error:", month_key, e, flush=True)
-        return []
-
-
-def save_month_records(month_key, rows):
-    filename = f"{RECORD_GIST_PREFIX}{month_key}.json"
-    payload = {
-        "version": 1,
-        "month": month_key,
-        "updated_at": now_my().isoformat(),
-        "records": rows
-    }
-    return patch_gist_file(
-        filename,
-        json.dumps(payload, ensure_ascii=False, indent=2)
-    )
+    return dict(record)
 
 
 def upsert_record_persistent(record):
-    if not storage_configured():
-        return False, "Permanent Storage belum disambung"
-
-    month_key = date.fromisoformat(record["bagging_date"]).strftime("%Y%m")
-
-    with gist_lock:
-        try:
-            snapshot = get_gist_snapshot()
-            rows = load_month_records(month_key, snapshot=snapshot)
-            stored = normalize_record_for_storage(record)
-
-            replaced = False
-            for i, row in enumerate(rows):
-                if row.get("rid") == record.get("rid"):
-                    rows[i] = stored
-                    replaced = True
-                    break
-
-            if not replaced:
-                rows.append(stored)
-
-            rows.sort(key=lambda r: (
-                r.get("bagging_date", ""),
-                r.get("created_at", ""),
-                r.get("rid", "")
-            ))
-
-            return save_month_records(month_key, rows)
-        except Exception as e:
-            print("upsert_record_persistent error:", e, flush=True)
-            return False, str(e)
+    db.save(normalize_record_for_storage(record))
+    return True, None
 
 
 def get_record_persistent(rid, bagging_date=None):
-    preferred_months = []
-
-    if bagging_date:
-        try:
-            preferred_months.append(date.fromisoformat(bagging_date).strftime("%Y%m"))
-        except Exception:
-            pass
-
-    if re.match(r"^\d{6}", str(rid or "")):
-        rid_month = str(rid)[:6]
-        if rid_month not in preferred_months:
-            preferred_months.append(rid_month)
-
-    try:
-        snapshot = get_gist_snapshot()
-    except Exception:
-        return None
-
-    all_months = sorted([
-        name[len(RECORD_GIST_PREFIX):-5]
-        for name in snapshot.get("files", {})
-        if name.startswith(RECORD_GIST_PREFIX) and name.endswith(".json")
-    ], reverse=True)
-
-    # Late/backdated records are stored under Bagging Date month, while RID uses
-    # the actual creation month. Therefore always fall back to all record files.
-    month_keys = preferred_months + [m for m in all_months if m not in preferred_months]
-
-    for month_key in month_keys:
-        for row in load_month_records(month_key, snapshot=snapshot):
-            if row.get("rid") == rid:
-                return row
-    return None
+    return db.get_record(rid)
 
 
 def load_records_range(start_date, end_date, outlet=None):
-    if not storage_configured():
-        return []
-
-    try:
-        snapshot = get_gist_snapshot()
-    except Exception as e:
-        print("load_records_range snapshot error:", e, flush=True)
-        return []
-
-    result = []
-    for month_key in months_between(start_date, end_date):
-        for row in load_month_records(month_key, snapshot=snapshot):
-            try:
-                bag_date = date.fromisoformat(row.get("bagging_date", ""))
-            except Exception:
-                continue
-            if not (start_date <= bag_date <= end_date):
-                continue
-            if outlet and row.get("outlet") != outlet:
-                continue
-            result.append(row)
-
-    result.sort(key=lambda r: (
-        r.get("bagging_date", ""),
-        r.get("created_at", ""),
-        r.get("outlet", ""),
-        r.get("seal", "")
-    ))
-    return result
+    params={'bagging_date':'gte.'+start_date.isoformat(),'and':'(bagging_date.lte.'+end_date.isoformat()+')'}
+    if outlet: params['outlet']='eq.'+outlet
+    return db.rows(params)
 
 
 def load_all_records():
-    if not storage_configured():
-        return []
-
-    try:
-        snapshot = get_gist_snapshot()
-    except Exception:
-        return []
-
-    month_keys = sorted([
-        name[len(RECORD_GIST_PREFIX):-5]
-        for name in snapshot.get("files", {})
-        if name.startswith(RECORD_GIST_PREFIX) and name.endswith(".json")
-    ])
-
-    rows = []
-    for month_key in month_keys:
-        rows.extend(load_month_records(month_key, snapshot=snapshot))
-
-    rows.sort(key=lambda r: (
-        r.get("bagging_date", ""),
-        r.get("created_at", ""),
-        r.get("rid", "")
-    ))
-    return rows
+    return db.rows()
 
 
 def find_existing_record(outlet, seal, bagging_date):
-    try:
-        month_key = date.fromisoformat(bagging_date).strftime("%Y%m")
-        snapshot = get_gist_snapshot()
-        rows = load_month_records(month_key, snapshot=snapshot)
-    except Exception:
-        return None
-
-    matches = [
-        r for r in rows
-        if r.get("outlet") == outlet
-        and str(r.get("seal", "")).upper() == str(seal).upper()
-        and r.get("bagging_date") == bagging_date
-        and r.get("status") != "CANCELLED"
-    ]
-    if not matches:
-        return None
-    matches.sort(key=lambda r: r.get("created_at", ""), reverse=True)
-    return matches[0]
+    rows=db.rows({'outlet':'eq.'+outlet,'seal':'eq.'+seal.upper(),'bagging_date':'eq.'+bagging_date,'status':'neq.CANCELLED'})
+    return rows[0] if rows else None
 
 # ============================================================
 # KEYBOARDS
@@ -941,6 +624,11 @@ def create_record(user_id, chat_id, outlet, seal, bagging_date, entry_mode="NORM
         "cancelled_at": None
     }
 
+    try:
+        db.api('sgsb_records','POST',{'rid':record['rid'],'data':record})
+    except db.DuplicateRecord:
+        return None, {'duplicate':True,'record':find_existing_record(outlet,seal,bagging_date)}
+
     result = send_new_record_card(record)
     if not result.get("ok"):
         return None, result
@@ -964,6 +652,8 @@ def create_record(user_id, chat_id, outlet, seal, bagging_date, entry_mode="NORM
 
 def resume_existing_record(user_id, chat_id, stored):
     record = dict(stored)
+    if record.get("owner_id") != user_id and not admin_authenticated(user_id):
+        return None, "Rekod ini milik pengguna lain. Hubungi admin untuk recovery."
     record["owner_id"] = user_id
     record["chat_id"] = chat_id
     record["archiving"] = False
@@ -997,10 +687,10 @@ def reconstruct_record_from_reply(user_id, chat_id, reply_message):
     with state_lock:
         existing = records.get(rid)
         if existing:
-            return existing
+            return existing if existing.get("owner_id") == user_id or admin_authenticated(user_id) else None
 
     stored = get_record_persistent(rid, ref.get("bagging_date"))
-    if not stored:
+    if not stored or (stored.get("owner_id") != user_id and not admin_authenticated(user_id)):
         return None
 
     record = dict(stored)
@@ -1016,12 +706,7 @@ def reconstruct_record_from_reply(user_id, chat_id, reply_message):
 
 
 def open_records_for_user(user_id):
-    with state_lock:
-        return [
-            r for r in records.values()
-            if r.get("owner_id") == user_id
-            and r.get("status") not in ("COMPLETE", "LATE_COMPLETE", "CANCELLED")
-        ]
+    return db.rows({'owner_id':'eq.'+str(user_id),'status':'not.in.(COMPLETE,LATE_COMPLETE,CANCELLED)'})
 
 
 def resolve_record_for_media(message, user_id, chat_id):
@@ -1033,6 +718,7 @@ def resolve_record_for_media(message, user_id, chat_id):
             record["owner_id"] = user_id
             record["chat_id"] = chat_id
             return record, None
+        return None, "⚠️ Record Card tidak sah atau milik pengguna lain. Reply Record Card yang betul."
 
     open_records = open_records_for_user(user_id)
 
@@ -1108,10 +794,14 @@ def archive_record(record):
     if not record.get("photo") or not record.get("video"):
         return False, "Record belum lengkap"
 
+    if record.get("archive_delivery_state") in ("SENDING", "UNKNOWN"):
+        return False, "Status Archive perlu disemak oleh admin sebelum retry bagi mengelakkan album duplicate."
     if record.get("archiving"):
         return False, "Archive sedang diproses"
 
     record["archiving"] = True
+    record["archive_delivery_state"] = "SENDING"
+    upsert_record_persistent(record)
     record["archive_failed"] = False
     update_record_card(record)
 
@@ -1132,6 +822,7 @@ def archive_record(record):
     record["archiving"] = False
 
     if not result.get("ok"):
+        record["archive_delivery_state"] = "UNKNOWN" if result.get("ambiguous") else "FAILED"
         record["archive_failed"] = True
         record["status"] = "ARCHIVE_FAILED"
         upsert_record_persistent(record)
@@ -1141,6 +832,8 @@ def archive_record(record):
         return False, error
 
     record["archived"] = True
+    record["archive_delivery_state"] = "SENT"
+    record["archive_message_ids"] = [m["message_id"] for m in result.get("result", [])]
     record["archive_failed"] = False
     record["archived_at"] = now_my().isoformat()
     record["status"] = determine_final_status(record)
@@ -1197,6 +890,8 @@ def maybe_archive_record(record):
 # ============================================================
 
 def start_builder(chat_id, user_id, mode="NORMAL"):
+    if not load_outlets_from_supabase():
+        raise db.StorageError(db.FRIENDLY)
     with state_lock:
         builders[user_id] = {
             "mode": mode,
@@ -1363,7 +1058,7 @@ def handle_admin_text(chat_id, user_id, text):
         return False
 
     if adm.get("step") == "passcode":
-        if text == ADMIN_PASSCODE:
+        if ADMIN_PASSCODE and secrets.compare_digest(text, ADMIN_PASSCODE):
             show_admin_menu(chat_id, user_id)
         else:
             admin_sessions.pop(user_id, None)
@@ -1388,7 +1083,7 @@ def handle_admin_text(chat_id, user_id, text):
             return True
 
         updated = current + [outlet]
-        ok, error = save_outlets_to_gist(updated)
+        ok, error = save_outlets_to_supabase(updated)
         if not ok:
             adm["step"] = "menu"
             send_message(
@@ -1482,7 +1177,7 @@ def build_report_context(rows, start_date=None, end_date=None, outlet=None, titl
         "incomplete": incomplete,
         "outlet_counts": outlet_counts,
         "daily_counts": daily_counts,
-        "submitted_outlets": submitted_outlets,
+        "submitted_outlets": sorted(submitted_outlets),
         "no_submission": no_submission,
         "missing_photo": sum(1 for r in active if not r.get("photo")),
         "missing_video": sum(1 for r in active if not r.get("video")),
@@ -1908,7 +1603,7 @@ def handle_report_text(chat_id, user_id, text):
     step = session.get("step")
 
     if step == "passcode":
-        if text == ADMIN_PASSCODE:
+        if ADMIN_PASSCODE and secrets.compare_digest(text, ADMIN_PASSCODE):
             admin_sessions[user_id] = {"authenticated": True, "step": "menu"}
             report_sessions[user_id] = {"step": "menu"}
             send_message(chat_id, "✅ Access dibenarkan.\n\nPilih jenis report:", report_menu_keyboard())
@@ -2022,11 +1717,11 @@ def deliver_report_format(chat_id, user_id, fmt):
             chat_id,
             "❌ Library report belum terpasang pada Render.\n"
             "Pastikan requirements.txt V5 sudah digunakan.\n"
-            f"<code>{safe_html(e)}</code>"
+            "Sila cuba semula atau hubungi admin."
         )
     except Exception as e:
-        print("Report generation error:", repr(e), flush=True)
-        send_message(chat_id, f"❌ Report generation error: <code>{safe_html(e)}</code>")
+        print("Report generation error:", type(e).__name__, flush=True)
+        send_message(chat_id, "❌ Report gagal dijana. Sila cuba semula atau hubungi admin.")
     finally:
         if filepath:
             try:
@@ -2117,6 +1812,9 @@ def handle_message(message):
 
         if "photo" in message:
             if record.get("photo"):
+                if record["photo"].get("message_id") == message["message_id"]:
+                    maybe_archive_record(record)
+                    return
                 send_message(chat_id, "⚠️ Record ini sudah mempunyai 1 gambar.")
                 return
 
@@ -2125,6 +1823,8 @@ def handle_message(message):
                 "file_id": photo["file_id"],
                 "message_id": message["message_id"]
             }
+            if record.get("photo") and record.get("video") and not record.get("completed_at"):
+                record["completed_at"] = now_my().isoformat()
             with state_lock:
                 records[record["rid"]] = record
             send_message(chat_id, f"📷 Gambar diterima untuk <b>{safe_html(record['seal'])}</b>.")
@@ -2133,6 +1833,9 @@ def handle_message(message):
 
         if "video" in message:
             if record.get("video"):
+                if record["video"].get("message_id") == message["message_id"]:
+                    maybe_archive_record(record)
+                    return
                 send_message(chat_id, "⚠️ Record ini sudah mempunyai 1 video.")
                 return
 
@@ -2141,6 +1844,8 @@ def handle_message(message):
                 "file_id": video["file_id"],
                 "message_id": message["message_id"]
             }
+            if record.get("photo") and record.get("video") and not record.get("completed_at"):
+                record["completed_at"] = now_my().isoformat()
             with state_lock:
                 records[record["rid"]] = record
             send_message(chat_id, f"🎥 Video diterima untuk <b>{safe_html(record['seal'])}</b>.")
@@ -2211,7 +1916,7 @@ def handle_message(message):
     if not builder:
         send_message(
             chat_id,
-            "👋 <b>SGSB Bagging Bot V5</b>\n\n"
+            "👋 <b>SGSB Bagging Bot V5.1</b>\n\n"
             "Bagging baru: /start\n"
             "Late / missing media: /late\n"
             "Report: /report\n"
@@ -2297,6 +2002,9 @@ def handle_callback(callback):
             send_message(chat_id, "⚠️ Record tidak dijumpai.")
             return
 
+        if record.get("owner_id") != user_id and not admin_authenticated(user_id):
+            send_message(chat_id, "⚠️ Rekod ini milik pengguna lain.")
+            return
         input_modes[user_id] = {"type": "remark", "rid": rid}
         send_message(chat_id, f"📝 Taip remark untuk Seal <b>{safe_html(record.get('seal'))}</b>.")
         return
@@ -2308,6 +2016,9 @@ def handle_callback(callback):
             send_message(chat_id, "⚠️ Record tidak dijumpai.")
             return
 
+        if record.get("owner_id") != user_id and not admin_authenticated(user_id):
+            send_message(chat_id, "⚠️ Rekod ini milik pengguna lain.")
+            return
         record["owner_id"] = user_id
         record["chat_id"] = chat_id
         record["archiving"] = False
@@ -2331,6 +2042,9 @@ def handle_callback(callback):
 
         record["status"] = "CANCELLED"
         record["cancelled_at"] = now_my().isoformat()
+        if record.get("owner_id") != user_id and not admin_authenticated(user_id):
+            send_message(chat_id, "⚠️ Rekod ini milik pengguna lain.")
+            return
         record["owner_id"] = user_id
         record["chat_id"] = chat_id
         upsert_record_persistent(record)
@@ -2350,6 +2064,9 @@ def handle_callback(callback):
         return
 
     # Report callbacks.
+    if data.startswith("report:") and not admin_authenticated(user_id):
+        begin_report(chat_id, user_id)
+        return
     if data == "report:menu":
         if not admin_authenticated(user_id):
             begin_report(chat_id, user_id)
@@ -2451,7 +2168,7 @@ def handle_callback(callback):
                 return
 
             updated = [x for x in current if x != outlet]
-            ok, error = save_outlets_to_gist(updated)
+            ok, error = save_outlets_to_supabase(updated)
             if not ok:
                 send_message(
                     chat_id,
@@ -2468,7 +2185,7 @@ def handle_callback(callback):
             return
 
         if data == "admin:sync":
-            ok = load_outlets_from_gist()
+            ok = load_outlets_from_supabase()
             if ok:
                 send_message(chat_id, f"✅ Outlet Master synced.\nTotal: {len(OUTLETS)}", admin_keyboard())
             else:
@@ -2489,13 +2206,10 @@ def handle_callback(callback):
 def home():
     return jsonify({
         "status": "ok",
-        "service": "SGSB Bagging Bot V5",
+        "service": "SGSB Bagging Bot V5.1",
         "outlets": len(OUTLETS),
-        "outlet_storage": "persistent-gist" if OUTLET_STORAGE_OK else "fallback-memory",
-        "open_runtime_records": len([
-            r for r in records.values()
-            if r.get("status") not in ("COMPLETE", "LATE_COMPLETE", "CANCELLED")
-        ]),
+        "outlet_storage": "supabase" if OUTLET_STORAGE_OK else "unavailable",
+        "metadata_storage": "supabase",
         "features": [
             "parallel-record-cards",
             "persistent-record-log",
@@ -2511,40 +2225,44 @@ def home():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "healthy",
-        "version": "5",
-        "storage": OUTLET_STORAGE_OK
-    })
+    connected=load_outlets_from_supabase()
+    return jsonify({'status':'healthy' if connected else 'degraded','version':'5.1','storage':'supabase','database_connected':connected}), 200 if connected else 503
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    if WEBHOOK_SECRET:
-        received_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if received_secret != WEBHOOK_SECRET:
-            return jsonify({"ok": False}), 403
-
+    if not WEBHOOK_SECRET or not secrets.compare_digest(request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""), WEBHOOK_SECRET):
+        return jsonify({"ok": False}), 403
     update = request.get_json(silent=True) or {}
-
-    if not remember_update(update.get("update_id")):
-        return jsonify({"ok": True, "duplicate": True})
-
+    update_id=update.get('update_id')
+    if not isinstance(update_id,int): return jsonify({'ok':False}),400
+    token=secrets.token_hex(16)
+    claimed=False
     try:
-        if "message" in update:
-            handle_message(update["message"])
-        elif "callback_query" in update:
-            handle_callback(update["callback_query"])
+        claim=db.rpc('sgsb_claim_update',{'p_id':update_id,'p_token':token})
+        if claim=='done': return jsonify({'ok':True,'duplicate':True})
+        if claim!='claimed': return jsonify({'ok':False,'retry':True}),503
+        claimed=True
+        if not load_outlets_from_supabase(): raise db.StorageError(db.FRIENDLY)
+        if "message" in update: handle_message(update["message"])
+        elif "callback_query" in update: handle_callback(update["callback_query"])
+        db.rpc('sgsb_finish_update',{'p_id':update_id,'p_token':token,'p_done':True})
+        return jsonify({'ok':True})
     except Exception as e:
-        print("Webhook processing error:", repr(e), flush=True)
-
-    return jsonify({"ok": True})
+        print('Webhook processing failed:',type(e).__name__,flush=True)
+        if claimed:
+            try: db.rpc('sgsb_finish_update',{'p_id':update_id,'p_token':token,'p_done':False})
+            except db.StorageError: pass
+        msg=update.get('message') or update.get('callback_query',{}).get('message',{})
+        chat_id=msg.get('chat',{}).get('id')
+        if chat_id: send_message(chat_id,'⚠️ '+db.FRIENDLY)
+        return jsonify({'ok':False,'retry':True}),503
 
 # ============================================================
 # STARTUP
 # ============================================================
 
-load_outlets_from_gist()
+load_outlets_from_supabase()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
