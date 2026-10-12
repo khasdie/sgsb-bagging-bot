@@ -7,6 +7,7 @@ import secrets
 import threading
 import tempfile
 import html
+import hashlib
 from collections import Counter
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -19,7 +20,7 @@ import storage_v5_1 as db
 app = Flask(__name__)
 
 # ============================================================
-# SGSB BAGGING BOT V5.1
+# SGSB BAGGING BOT V5.1.1
 # - Permanent Outlet Master (Supabase)
 # - Persistent bagging metadata and staff sessions (Supabase)
 # - Multiple/parallel Record Cards
@@ -61,6 +62,7 @@ builders = db.SessionMap("builder")         # user_id -> builder state
 input_modes = db.SessionMap("input")      # user_id -> remark input state
 admin_sessions = db.SessionMap("admin")   # user_id -> admin auth state
 report_sessions = db.SessionMap("report")  # user_id -> report query state
+media_sessions = db.SessionMap("media")  # durable album association and unassigned uploads
 processed_updates = {}
 
 state_lock = threading.RLock()
@@ -735,6 +737,97 @@ def resolve_record_for_media(message, user_id, chat_id):
         "⚠️ Tiada Bagging Session yang aktif.\n"
         "Tekan /start atau /late."
     )
+
+
+def media_session_key(message, user_id, chat_id):
+    group = message.get("media_group_id")
+    source = "album:" + str(group) if group else "message:" + str(message["message_id"])
+    return hashlib.sha256(f"{user_id}:{chat_id}:{source}".encode()).hexdigest()[:16]
+
+
+def media_reply(record, message):
+    return {**message, "reply_to_message": {
+        "message_id": record.get("card_message_id"), "text": record_ref(record)
+    }}
+
+
+def choose_pending_media(callback, token, rid, user_id, chat_id):
+    pending = media_sessions.get(token)
+    if not pending or pending.get("owner_id") != user_id or pending.get("chat_id") != chat_id:
+        send_message(chat_id, "⚠️ Pilihan media tidak sah atau milik pengguna lain.")
+        return
+    if pending.get("rid") and pending["rid"] != rid:
+        send_message(chat_id, "⚠️ Album ini sudah dipadankan kepada Seal lain.")
+        return
+    record = get_record_persistent(rid)
+    if not record or record.get("owner_id") != user_id or record.get("chat_id") != chat_id:
+        send_message(chat_id, "⚠️ Record Card tidak sah atau milik pengguna lain.")
+        return
+    if record.get("status") == "CANCELLED" or (
+        record.get("status") in ("COMPLETE", "LATE_COMPLETE") and not pending.get("rid")
+    ):
+        send_message(chat_id, "⚠️ Seal ini sudah selesai atau dibatalkan. Pilih Record Card yang masih OPEN.")
+        return
+    pending["rid"] = rid  # persist before processing; later album items use the same Seal
+    for item in list(pending.get("messages", [])):
+        handle_message(media_reply(record, item))
+    pending["messages"] = []
+    if pending.get("prompt_id"):
+        edit_message(chat_id, pending["prompt_id"],
+                     "✅ Media dipadankan kepada Seal <b>" + safe_html(record["seal"]) + "</b>.")
+
+
+def prepare_media(message, user_id, chat_id):
+    token = media_session_key(message, user_id, chat_id)
+    pending = media_sessions.get(token)
+    record, error = resolve_record_for_media(message, user_id, chat_id)
+    if pending and pending.get("rid"):
+        bound = get_record_persistent(pending["rid"])
+        if message.get("reply_to_message") and (not record or record["rid"] != pending["rid"]):
+            send_message(chat_id, "⚠️ Album ini sudah dipadankan kepada Seal lain. Hantar media berasingan untuk Seal seterusnya.")
+            return None
+        if not bound:
+            send_message(chat_id, "⚠️ Record album tidak dijumpai. Hubungi admin.")
+            return None
+        return bound
+    if pending and not message.get("reply_to_message"):
+        record = None  # An initially ambiguous album needs an explicit choice, even if another session closes.
+    if record:
+        if message.get("media_group_id") or pending:
+            if not pending:
+                media_sessions[token] = {"owner_id": user_id, "chat_id": chat_id,
+                                         "messages": [], "created_at": now_my().isoformat()}
+                pending = media_sessions[token]
+            pending["rid"] = record["rid"]
+            for item in list(pending.get("messages", [])):
+                handle_message(media_reply(record, item))
+            pending["messages"] = []
+            record = get_record_persistent(record["rid"])
+        return record
+    candidates = open_records_for_user(user_id) if not message.get("reply_to_message") else []
+    if (len(candidates) <= 1 and not pending) or not ("photo" in message or "video" in message):
+        send_message(chat_id, error)
+        return None
+    if not pending:
+        media_sessions[token] = {"owner_id": user_id, "chat_id": chat_id,
+                                 "messages": [], "created_at": now_my().isoformat()}
+        pending = media_sessions[token]
+    items = list(pending.get("messages", []))
+    if not any(item["message_id"] == message["message_id"] for item in items):
+        items.append(message)
+        pending["messages"] = items  # file_id survives restarts; no re-upload needed
+    if not pending.get("prompt_id"):
+        keyboard = {"inline_keyboard": [[{
+            "text": (r["outlet"] + " · " + r["seal"] + " · " + r["bagging_date"])[:100],
+            "callback_data": "media:" + token + ":" + r["rid"]
+        }] for r in candidates[:90]]}
+        result = send_message(chat_id,
+            "📎 Media diterima tetapi belum dipadankan kerana ada beberapa sesi OPEN.\n\n"
+            "<b>Pilih Seal yang betul untuk media/album ini.</b> Tidak perlu hantar semula.\n"
+            "Untuk upload seterusnya, reply Record Card yang betul.", keyboard)
+        if result.get("ok"):
+            pending["prompt_id"] = result["result"]["message_id"]
+    return None
 
 
 def determine_final_status(record):
@@ -1797,9 +1890,8 @@ def handle_message(message):
 
     # Media handling.
     if "photo" in message or "video" in message or "document" in message:
-        record, error = resolve_record_for_media(message, user_id, chat_id)
+        record = prepare_media(message, user_id, chat_id)
         if not record:
-            send_message(chat_id, error)
             return
 
         if record.get("status") in ("COMPLETE", "LATE_COMPLETE"):
@@ -1916,7 +2008,7 @@ def handle_message(message):
     if not builder:
         send_message(
             chat_id,
-            "👋 <b>SGSB Bagging Bot V5.1</b>\n\n"
+            "👋 <b>SGSB Bagging Bot V5.1.1</b>\n\n"
             "Bagging baru: /start\n"
             "Late / missing media: /late\n"
             "Report: /report\n"
@@ -1936,6 +2028,12 @@ def handle_callback(callback):
     data = callback.get("data", "")
 
     answer_callback(callback_id)
+
+    if data.startswith("media:"):
+        parts = data.split(":")
+        if len(parts) == 3:
+            choose_pending_media(callback, parts[1], parts[2], user_id, chat_id)
+        return
 
     if data == "noop":
         return
@@ -2206,7 +2304,7 @@ def handle_callback(callback):
 def home():
     return jsonify({
         "status": "ok",
-        "service": "SGSB Bagging Bot V5.1",
+        "service": "SGSB Bagging Bot V5.1.1",
         "outlets": len(OUTLETS),
         "outlet_storage": "supabase" if OUTLET_STORAGE_OK else "unavailable",
         "metadata_storage": "supabase",
@@ -2226,7 +2324,7 @@ def home():
 @app.route("/health", methods=["GET"])
 def health():
     connected=load_outlets_from_supabase()
-    return jsonify({'status':'healthy' if connected else 'degraded','version':'5.1','storage':'supabase','database_connected':connected}), 200 if connected else 503
+    return jsonify({'status':'healthy' if connected else 'degraded','version':'5.1.1','storage':'supabase','database_connected':connected}), 200 if connected else 503
 
 
 @app.route("/webhook", methods=["POST"])
