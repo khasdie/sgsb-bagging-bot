@@ -1,6 +1,8 @@
 import copy
 import os
 import json
+import base64
+import io
 import unittest
 from unittest.mock import patch
 from flask import Flask
@@ -141,6 +143,18 @@ class TransportTests(unittest.TestCase):
             with patch.dict(os.environ,{'FLEET_OWNER_ACCESS_REQUEST':json.dumps(config)}):
                 with self.assertRaises(ValueError): self.bot.apply_owner_access()
         self.assertEqual(self.db.reads,[])
+
+    def test_readonly_audit_decodes_actual_handler_photo_and_preserves_record(self):
+        from PIL import Image
+        rid=self.draft();self.bot.handle(self.cb('fl:confirm:'+rid))
+        image=io.BytesIO();Image.new('RGB',(32,24),'green').save(image,format='JPEG')
+        self.bot.image=lambda photo:{'mimeType':'image/jpeg','base64':base64.b64encode(image.getvalue()).decode()}
+        original=copy.deepcopy(self.db.rows)
+        with patch.dict(os.environ,{'FLEET_AUDIT_RECORD_ID':rid}):
+            result=self.bot.audit_read_only(Flask(__name__))
+        self.assertEqual((result['metadataHttp'],result['photoHttp'],result['width'],result['height']),(200,200,32,24))
+        self.assertTrue(result['recordUnchanged']);self.assertEqual(self.db.rows,original)
+        self.assertEqual(sum(m=='sendPhoto' for m,p in self.sent),1)
     def test_channel_must_differ_from_bagging_and_require_bot_post_permission(self):
         self.assertTrue(self.bot.enabled())
         with patch.dict(os.environ,{'ARCHIVE_CHAT_ID':'-1001234567890'}):

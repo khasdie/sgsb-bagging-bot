@@ -9,6 +9,7 @@ import uuid
 import time
 import threading
 import json
+import io
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import request, jsonify
@@ -103,7 +104,31 @@ class FleetBot:
                 self.db.api('sgsb_sessions','PATCH',{'data':{**data,'pinned':True}},params={'key':'eq.'+key})
         return bool(mid)
 
-    def activate(self):
+    def audit_read_only(self,app):
+        """Operator-selected record only; no upload, resend, repair or record writes."""
+        rid=os.environ.get('FLEET_AUDIT_RECORD_ID','')
+        if not re.fullmatch(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}',rid): raise FleetError('Invalid audit record.')
+        before=self.row(rid)
+        if not before or before['data'].get('state')!='SENT': raise FleetError('Audit requires a confirmed report.')
+        r=before['data'];channel=self.channel_id()
+        if r.get('outletCode') not in CODES or r.get('archiveChatId')!=channel: raise FleetError('Audit archive mismatch.')
+        header={'x-btm-fleet-key':os.environ.get('FLEET_BTM_READ_TOKEN','')}
+        query='/btm/fleet?outlets='+r['outletCode']+'&dateFrom='+r['reportDate']+'&dateTo='+r['reportDate']
+        with app.test_request_context(query,headers=header): response,status,_=self.read_http()
+        if status!=200: raise FleetError('Audit metadata read failed.')
+        records=response.get_json().get('data',{}).get('records',[])
+        matching=[v for v in records if v.get('id')==rid]
+        if len(matching)!=1 or matching[0]['telegramUrl']!=project(r,channel)['telegramUrl']: raise FleetError('Audit metadata mismatch.')
+        with app.test_request_context('/btm/fleet?outlets='+r['outletCode']+'&recordId='+rid+'&photoIndex=0',headers=header): response,image_status,_=self.read_http()
+        if image_status!=200: raise FleetError('Audit photo read failed.')
+        image=response.get_json()['data'];content=base64.b64decode(image['base64'],validate=True)
+        from PIL import Image
+        with Image.open(io.BytesIO(content)) as decoded:
+            width,height=decoded.size;decoded.verify()
+        if self.row(rid)!=before: raise FleetError('Audit source changed during read; review required.')
+        return {'status':'PASS','metadataHttp':status,'photoHttp':image_status,'photoCount':len(r['photos']),'imageBytes':len(content),'imageSha256':hashlib.sha256(content).hexdigest(),'width':width,'height':height,'archiveMatches':True,'recordUnchanged':True}
+
+    def activate(self,app=None):
         try:
             active=self.enabled()
             print('FLEET activation:', 'ready' if active else 'not-connected', flush=True)
@@ -111,6 +136,8 @@ class FleetBot:
                 print('FLEET owner access:',self.apply_owner_access(),flush=True)
             if active and os.environ.get('FLEET_CHANNEL_START','1')=='1':
                 print('FLEET channel launcher:', 'confirmed' if self.publish_launcher() else 'review-required', flush=True)
+            if active and app is not None and os.environ.get('FLEET_AUDIT_RECORD_ID'):
+                print('FLEET read-only audit:',json.dumps(self.audit_read_only(app),sort_keys=True),flush=True)
         except Exception:
             print('FLEET activation: temporarily-unavailable; existing data retained',flush=True)
 
@@ -361,5 +388,5 @@ def install(app,db,telegram,admin_sessions):
     bot=FleetBot(db,telegram,admin_sessions)
     app.add_url_rule('/btm/fleet','btm_fleet',bot.read_http,methods=['GET'])
     if os.environ.get('FLEET_ENABLED')=='1':
-        threading.Thread(target=bot.activate,daemon=True,name='fleet-activation').start()
+        threading.Thread(target=lambda:bot.activate(app),daemon=True,name='fleet-activation').start()
     return bot
