@@ -1,5 +1,6 @@
 import copy
 import os
+import json
 import unittest
 from unittest.mock import patch
 from flask import Flask
@@ -110,6 +111,36 @@ class TransportTests(unittest.TestCase):
         self.assertIn('fl:quick:SBH307',str(self.sent[-1]))
         self.bot.admin_sessions.pop(99)
         self.assertEqual(self.bot.allowed(99),[])
+
+    def test_explicit_owner_mapping_atomic_backup_readback_and_no_regrant(self):
+        uid=123456789;old={'outlets':['SBH307'],'source':'ORIGINAL'}
+        self.db.sessions['fleet_access'][uid]=copy.deepcopy(old);markers={};writes=[]
+        def api(table,method='GET',data=None,params=None,prefer=None):
+            self.assertEqual(table,'sgsb_sessions')
+            if method=='GET': return [{'data':markers[params['key'][3:]]}] if params['key'][3:] in markers else []
+            self.assertEqual(method,'POST');self.assertEqual(len(data),2);writes.append(copy.deepcopy(data))
+            self.db.sessions['fleet_access'][uid]=data[0]['data'];markers[data[1]['key']]=data[1]['data']
+        self.db.api=api
+        request={'requestId':'SYNTHETIC-owner-v1','userId':str(uid),'outlets':['SBH306','SBH307']}
+        with patch.dict(os.environ,{'FLEET_OWNER_ACCESS_REQUEST':json.dumps(request)}):
+            self.assertEqual(self.bot.apply_owner_access(),'applied-and-verified-2-outlets')
+            self.assertEqual(self.bot.allowed(uid),['SBH306','SBH307'])
+            self.assertEqual(next(iter(markers.values()))['previousAccess'],old)
+            self.db.sessions['fleet_access'][uid]={'outlets':[]}
+            self.assertEqual(self.bot.apply_owner_access(),'already-applied')
+            self.assertEqual(self.bot.allowed(uid),[]);self.assertEqual(len(writes),1)
+            request['outlets']=['SBH306']
+            with patch.dict(os.environ,{'FLEET_OWNER_ACCESS_REQUEST':json.dumps(request)}):
+                with self.assertRaises(ValueError): self.bot.apply_owner_access()
+
+    def test_owner_mapping_rejects_bad_scope_before_writes(self):
+        requests=[{'requestId':'SYNTHETIC-owner-v1','userId':'123456789','outlets':['YOYI']},
+                  {'requestId':'SYNTHETIC-owner-v1','userId':'123456789','outlets':['SBH307','SBH307']},
+                  {'userId':'123456789','outlets':['SBH307']},[]]
+        for config in requests:
+            with patch.dict(os.environ,{'FLEET_OWNER_ACCESS_REQUEST':json.dumps(config)}):
+                with self.assertRaises(ValueError): self.bot.apply_owner_access()
+        self.assertEqual(self.db.reads,[])
     def test_channel_must_differ_from_bagging_and_require_bot_post_permission(self):
         self.assertTrue(self.bot.enabled())
         with patch.dict(os.environ,{'ARCHIVE_CHAT_ID':'-1001234567890'}):

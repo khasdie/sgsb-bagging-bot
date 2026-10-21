@@ -8,6 +8,7 @@ import re
 import uuid
 import time
 import threading
+import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import request, jsonify
@@ -45,6 +46,39 @@ class FleetBot:
     def enabled(self):
         return os.environ.get('FLEET_ENABLED')=='1' and len(os.environ.get('FLEET_BTM_READ_TOKEN',''))>=43 and bool(self.channel_id())
 
+    def apply_owner_access(self):
+        """Explicit operator-approved, one-time account mapping; preserve prior ACL."""
+        raw=os.environ.get('FLEET_OWNER_ACCESS_REQUEST','')
+        if not raw: return 'not-configured'
+        if len(raw)>2000: raise FleetError('Invalid owner access request.')
+        try: config=json.loads(raw)
+        except (ValueError,TypeError): raise FleetError('Invalid owner access request.') from None
+        if not isinstance(config,dict) or set(config)!={'requestId','userId','outlets'}:
+            raise FleetError('Invalid owner access request.')
+        uid=config['userId'];outlets=config['outlets'];request_id=config['requestId']
+        if not isinstance(uid,str) or not re.fullmatch(r'[1-9][0-9]{4,19}',uid) or not isinstance(request_id,str) or not re.fullmatch(r'[A-Za-z0-9_-]{8,80}',request_id):
+            raise FleetError('Invalid owner access request.')
+        if not isinstance(outlets,list) or not outlets or len(outlets)>len(CODES) or any(c not in CODES for c in outlets) or len(set(outlets))!=len(outlets):
+            raise FleetError('Invalid owner outlet scope.')
+        key='fleet_owner_access:'+request_id
+        fingerprint=hashlib.sha256(json.dumps(config,sort_keys=True).encode()).hexdigest()
+        existing=self.db.api('sgsb_sessions',params={'key':'eq.'+key,'select':'data','limit':1})
+        if existing:
+            if existing[0]['data'].get('requestHash')!=fingerprint or existing[0]['data'].get('state')!='APPLIED':
+                raise FleetError('Owner access request needs review.')
+            # Never regrant after a subsequent administrator revocation/change.
+            return 'already-applied'
+        previous=self.access.get(int(uid))
+        now=datetime.now(TZ).isoformat()
+        access={'outlets':sorted(outlets),'source':'OWNER_CONFIRMED_REQUEST','requestId':request_id,'updatedAt':now}
+        marker={'state':'APPLIED','requestHash':fingerprint,'userId':uid,'previousAccess':dict(previous) if previous is not None else None,'assignedOutlets':sorted(outlets),'appliedAt':now}
+        # PostgREST writes this array in one transaction: backup + account mapping.
+        self.db.api('sgsb_sessions','POST',[{'key':'fleet_access:'+uid,'data':access,'updated_at':now},{'key':key,'data':marker,'updated_at':now}],params={'on_conflict':'key'},prefer='resolution=merge-duplicates,return=minimal')
+        actual=self.access.get(int(uid)) or {}
+        if actual.get('outlets')!=sorted(outlets) or actual.get('requestId')!=request_id:
+            raise FleetError('Owner access read-back unconfirmed.')
+        return 'applied-and-verified-'+str(len(outlets))+'-outlets'
+
     def publish_launcher(self):
         """One durable claim before publishing; an ambiguous send is never repeated."""
         if not self.enabled(): return False
@@ -73,6 +107,8 @@ class FleetBot:
         try:
             active=self.enabled()
             print('FLEET activation:', 'ready' if active else 'not-connected', flush=True)
+            if active and os.environ.get('FLEET_OWNER_ACCESS_REQUEST'):
+                print('FLEET owner access:',self.apply_owner_access(),flush=True)
             if active and os.environ.get('FLEET_CHANNEL_START','1')=='1':
                 print('FLEET channel launcher:', 'confirmed' if self.publish_launcher() else 'review-required', flush=True)
         except Exception:
