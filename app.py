@@ -16,6 +16,7 @@ import requests
 from flask import Flask, request, jsonify
 from zoneinfo import ZoneInfo
 from fleet_bot import install as install_fleet
+from report_menu import install as install_report_menu
 import storage_v5_1 as db
 
 app = Flask(__name__)
@@ -2343,7 +2344,8 @@ def webhook():
         if claim!='claimed': return jsonify({'ok':False,'retry':True}),503
         claimed=True
         if not load_outlets_from_supabase(): raise db.StorageError(db.FRIENDLY)
-        if fleet_bot.handle(update): pass
+        if report_menu.handle(update): pass
+        elif fleet_bot.handle(update): pass
         elif "message" in update: handle_message(update["message"])
         elif "callback_query" in update: handle_callback(update["callback_query"])
         db.rpc('sgsb_finish_update',{'p_id':update_id,'p_token':token,'p_done':True})
@@ -2363,6 +2365,24 @@ def webhook():
 # ============================================================
 
 fleet_bot = install_fleet(app, db, telegram, admin_sessions)
+
+def open_bagging_from_menu(chat_id,user_id):
+    builder=builders.get(user_id)
+    if not builder:
+        start_builder(chat_id,user_id,mode='NORMAL');return
+    step=builder.get('step')
+    if step=='outlet':
+        send_message(chat_id,'Continue your existing Video Bagging report. Choose outlet:',outlet_keyboard('late_outlet' if builder.get('mode')=='LATE' else 'outlet'))
+    elif step=='seal':
+        send_message(chat_id,'Continue Video Bagging for <b>'+safe_html(builder.get('outlet'))+'</b>. Enter the Seal Bag Number.')
+    elif step=='late_date':
+        send_message(chat_id,'Continue your existing backdated report. Enter its original date (DD/MM/YYYY).',late_date_keyboard())
+    elif step=='late_reason':
+        send_message(chat_id,'Continue your existing backdated report. Enter the reason, or /skip.')
+    else:
+        send_message(chat_id,'Your existing Bagging input is kept. Continue from its original message; /menu does not reset it.')
+
+report_menu = install_report_menu(db,telegram,fleet_bot,open_bagging_from_menu)
 load_outlets_from_supabase()
 
 if __name__ == "__main__":
