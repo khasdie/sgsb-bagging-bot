@@ -95,6 +95,21 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(self.bot.allowed(99),[])
         self.bot.handle(self.cb('fl:outlet:SBH307',user=99));self.assertEqual(self.db.rows,{})
         self.bot.handle(self.msg('/fleet_access 99 SBH307'));self.assertEqual(self.bot.allowed(99),[])
+
+    def test_unassigned_user_can_identify_self_without_grant_or_other_user_data(self):
+        self.bot.handle(self.msg('/fleet',user=99))
+        self.assertIn('Your Telegram ID: <code>99</code>',self.sent[-1][1]['text'])
+        self.assertEqual(self.bot.allowed(99),[]);self.assertEqual(self.db.rows,{})
+        self.bot.handle(self.msg('/fleet_id',user=99))
+        self.assertIn('<code>99</code>',self.sent[-1][1]['text'])
+        self.assertEqual(self.bot.allowed(99),[])
+
+    def test_existing_authenticated_admin_uses_original_access_and_expiry_denies(self):
+        self.bot.admin_sessions[99]={'authenticated':True}
+        self.bot.handle(self.msg('/fleet',user=99))
+        self.assertIn('fl:quick:SBH307',str(self.sent[-1]))
+        self.bot.admin_sessions.pop(99)
+        self.assertEqual(self.bot.allowed(99),[])
     def test_channel_must_differ_from_bagging_and_require_bot_post_permission(self):
         self.assertTrue(self.bot.enabled())
         with patch.dict(os.environ,{'ARCHIVE_CHAT_ID':'-1001234567890'}):

@@ -109,7 +109,7 @@ class FleetBot:
             self.send(chat,'FLEET is not enabled yet. Bagging continues normally.');return
         codes=self.allowed(user)
         if not codes:
-            self.send(chat,'FLEET outlet access has not been verified. Contact your administrator.');return
+            self.send(chat,'FLEET outlet access has not been verified.\nYour Telegram ID: <code>'+str(user)+'</code>\nSend this ID and your outlet code to your administrator for Fleet access.\nExisting bot administrators can sign in using /admin, then open /fleet again. Never share your passcode in another chat.');return
         current=self.sessions.get(user)
         if current and current.get('id'):
             row=self.row(current['id'])
@@ -124,7 +124,7 @@ class FleetBot:
         if not user or msg.get('chat',{}).get('type')!='private': return False
         command=text.split('@')[0].split(' ')[0]
         deep_link=command=='/start' and text.split()[1:]==['fleet']
-        is_fleet=bool(cb and data.startswith('fl:')) or command in ('/fleet','/fleet_cancel','/fleet_access') or deep_link
+        is_fleet=bool(cb and data.startswith('fl:')) or command in ('/fleet','/fleet_id','/fleet_cancel','/fleet_access') or deep_link
         reply=msg.get('reply_to_message',{}).get('text','')
         match=re.search(r'Record: ([0-9a-f-]{36})',reply) if 'FLEET REPORT' in reply else None
         date_reply=reply.startswith('FLEET DATE')
@@ -148,6 +148,8 @@ class FleetBot:
         # Never steal Bagging photos or remark replies, even with a Fleet draft.
         try:
             if cb: self.telegram('answerCallbackQuery',{'callback_query_id':cb['id']})
+            if command=='/fleet_id':
+                self.send(chat,'Your Telegram ID: <code>'+str(user)+'</code>\nThis identifies your own Telegram account; it does not grant access or change your role.');return True
             if command=='/fleet_access':
                 if not (self.admin_sessions.get(user) or {}).get('authenticated'): raise FleetError('Sign in with the existing /admin flow first.')
                 parts=text.split()
