@@ -15,6 +15,7 @@ from pathlib import Path
 import requests
 from flask import Flask, request, jsonify
 from zoneinfo import ZoneInfo
+from fleet_bot import install as install_fleet
 import storage_v5_1 as db
 
 app = Flask(__name__)
@@ -2342,7 +2343,8 @@ def webhook():
         if claim!='claimed': return jsonify({'ok':False,'retry':True}),503
         claimed=True
         if not load_outlets_from_supabase(): raise db.StorageError(db.FRIENDLY)
-        if "message" in update: handle_message(update["message"])
+        if fleet_bot.handle(update): pass
+        elif "message" in update: handle_message(update["message"])
         elif "callback_query" in update: handle_callback(update["callback_query"])
         db.rpc('sgsb_finish_update',{'p_id':update_id,'p_token':token,'p_done':True})
         return jsonify({'ok':True})
@@ -2360,6 +2362,7 @@ def webhook():
 # STARTUP
 # ============================================================
 
+fleet_bot = install_fleet(app, db, telegram, admin_sessions)
 load_outlets_from_supabase()
 
 if __name__ == "__main__":
