@@ -7,6 +7,7 @@ import os
 import re
 import uuid
 import time
+import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import request, jsonify
@@ -43,6 +44,39 @@ class FleetBot:
 
     def enabled(self):
         return os.environ.get('FLEET_ENABLED')=='1' and len(os.environ.get('FLEET_BTM_READ_TOKEN',''))>=43 and bool(self.channel_id())
+
+    def publish_launcher(self):
+        """One durable claim before publishing; an ambiguous send is never repeated."""
+        if not self.enabled(): return False
+        channel=self.channel_id();key='fleet_launcher:'+channel+':v1'
+        existing=self.db.api('sgsb_sessions',params={'key':'eq.'+key,'select':'data','limit':1})
+        if existing:
+            data=existing[0]['data'];mid=data.get('messageId')
+            if mid and not data.get('pinned'):
+                pinned=self.telegram('pinChatMessage',{'chat_id':channel,'message_id':mid,'disable_notification':True})
+                if pinned.get('ok'):
+                    self.db.api('sgsb_sessions','PATCH',{'data':{**data,'pinned':True}},params={'key':'eq.'+key})
+            return bool(mid)
+        claim=self.db.api('sgsb_sessions','POST',{'key':key,'data':{'state':'SENDING'}},params={'on_conflict':'key'},prefer='resolution=ignore-duplicates,return=representation')
+        if not claim: return False
+        result=self.telegram('sendMessage',{'chat_id':channel,'text':'SGSB FLEET\n1. Tap Start FLEET\n2. Choose your outlet\n3. Choose OFFLOAD or CLEAR\n4. Send photos, review and confirm\n5. Continue with the next outlet\n\nPhotos remain in Telegram. BTM updates automatically. Only assigned outlets can submit.', 'reply_markup':{'inline_keyboard':[[{'text':'Start FLEET','url':'https://t.me/'+self.bot_username+'?start=fleet'}]]},'disable_notification':True})
+        mid=result.get('result',{}).get('message_id') if result.get('ok') else None
+        data={'state':'SENT' if mid else 'UNKNOWN','messageId':mid,'pinned':False}
+        self.db.api('sgsb_sessions','PATCH',{'data':data},params={'key':'eq.'+key})
+        if mid:
+            pinned=self.telegram('pinChatMessage',{'chat_id':channel,'message_id':mid,'disable_notification':True})
+            if pinned.get('ok'):
+                self.db.api('sgsb_sessions','PATCH',{'data':{**data,'pinned':True}},params={'key':'eq.'+key})
+        return bool(mid)
+
+    def activate(self):
+        try:
+            active=self.enabled()
+            print('FLEET activation:', 'ready' if active else 'not-connected', flush=True)
+            if active and os.environ.get('FLEET_CHANNEL_START','1')=='1':
+                print('FLEET channel launcher:', 'confirmed' if self.publish_launcher() else 'review-required', flush=True)
+        except Exception:
+            print('FLEET activation: temporarily-unavailable; existing data retained',flush=True)
 
     def allowed(self,user_id):
         admin=self.admin_sessions.get(user_id)
@@ -81,7 +115,7 @@ class FleetBot:
             row=self.row(current['id'])
             if row and row['data']['state']=='DRAFT':
                 self.send(chat,*self.card(row['data']));return
-        self.send(chat,'FLEET · Choose your outlet. Bagging records remain separate.',[[{'text':c,'callback_data':'fl:outlet:'+c}] for c in codes])
+        self.send(chat,'FLEET · Choose your outlet for today. Bagging records remain separate.',[[{'text':c,'callback_data':'fl:quick:'+c}] for c in codes]+[[{'text':'Report for another date','callback_data':'fl:backdated'}]])
 
     def handle(self,update):
         cb=update.get('callback_query');msg=(cb or {}).get('message') or update.get('message') or {}
@@ -126,6 +160,10 @@ class FleetBot:
                 self.sessions.pop(user,None);self.send(chat,'FLEET draft retained. Use /fleet to start again; Bagging is unchanged.');return True
             if command=='/fleet' or deep_link: self.start(chat,user,update['update_id']);return True
             if not self.enabled(): raise FleetError('FLEET is not enabled yet.')
+            if data=='fl:next': self.start(chat,user,update['update_id']);return True
+            if data=='fl:backdated':
+                self.send(chat,'Choose an outlet, then the original report date.',[[{'text':c,'callback_data':'fl:outlet:'+c}] for c in self.allowed(user)])
+                return True
             event='fleet:'+str(update['update_id'])
             memo=self.db.api('sgsb_fleet_events',params={'event_id':'eq.'+event,'select':'result','limit':1})
             if memo:
@@ -133,6 +171,17 @@ class FleetBot:
                 self.send(chat,'FLEET input already retained. Use the original report; do not upload again.')
                 return True
             codes=self.allowed(user)
+            if data.startswith('fl:quick:'):
+                outlet=data.split(':')[2]
+                if outlet not in codes: raise FleetError('Outlet access denied.')
+                current=self.sessions.get(user)
+                old=self.row(current['id']) if current and current.get('id') else None
+                if old and old['data']['state']=='DRAFT':
+                    self.send(chat,*self.card(old['data']));return True
+                rid=str(uuid.uuid5(uuid.NAMESPACE_URL,'sgsb-fleet:'+event))
+                r={'id':rid,'ownerId':user,'chatId':chat,'outletCode':outlet,'state':'DRAFT','photos':[],'remark':'','createdAt':datetime.now(TZ).isoformat(),'reportDate':datetime.now(TZ).date().isoformat()}
+                self.save(event,rid,user,0,r);self.sessions[user]={'step':'report','id':rid}
+                self.send(chat,*self.card(r));return True
             if data.startswith('fl:outlet:'):
                 outlet=data.split(':')[2]
                 if outlet not in codes: raise FleetError('Outlet access denied.')
@@ -182,7 +231,10 @@ class FleetBot:
             saved=self.save(event,rid,user,row['version'],changed)
             if data.startswith('fl:attach:'): self.pending_media.pop(token,None)
             if action=='confirm': self.archive(saved,event)
-            else: self.send(chat,*self.card(changed))
+            else:
+                self.send(chat,*self.card(changed))
+                if action=='decision':
+                    self.telegram('sendMessage',{'chat_id':chat,'text':'FLEET REPORT · '+changed['outletCode']+' · '+changed['decision']+'\nRecord: '+rid+'\nSend the outlet photo here. Then tap Confirm report on the card above.', 'reply_markup':{'force_reply':True,'selective':True}})
             return True
         except FleetError as exc:
             self.send(chat,html.escape(str(exc)));return True
@@ -206,7 +258,7 @@ class FleetBot:
             # A timeout may follow a successful send. Never blindly send again.
             self.save(event+':unknown',r['id'],r['ownerId'],row['version'],{**r,'state':'UNKNOWN'})
             self.send(chat,'FLEET delivery needs administrator review. Your photos and report are retained. Do not upload or confirm again.');return
-        self.send(chat,'FLEET ARCHIVE SUCCESS · '+r['outletCode']+' · '+r['reportDate']+' · '+r['decision']+'\nBTM updates automatically. Record: '+r['id'])
+        self.send(chat,'FLEET ARCHIVE SUCCESS · '+r['outletCode']+' · '+r['reportDate']+' · '+r['decision']+'\nBTM updates automatically. Record: '+r['id'],[[{'text':'Next outlet','callback_data':'fl:next'}]])
 
     def read_http(self):
         key=os.environ.get('FLEET_BTM_READ_TOKEN','');given=request.headers.get('x-btm-fleet-key','')
@@ -270,4 +322,6 @@ def date_value(value):
 def install(app,db,telegram,admin_sessions):
     bot=FleetBot(db,telegram,admin_sessions)
     app.add_url_rule('/btm/fleet','btm_fleet',bot.read_http,methods=['GET'])
+    if os.environ.get('FLEET_ENABLED')=='1':
+        threading.Thread(target=bot.activate,daemon=True,name='fleet-activation').start()
     return bot

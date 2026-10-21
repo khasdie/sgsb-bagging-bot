@@ -105,4 +105,50 @@ class TransportTests(unittest.TestCase):
         self.bot.telegram=lambda m,p:{'ok':True,'result':{'status':'member'}} if m=='getChatMember' else original(m,p)
         self.assertFalse(self.bot.enabled())
 
+    def test_quick_today_flow_guides_photo_and_next_outlet_preserves_history(self):
+        self.bot.handle(self.msg('/start fleet'))
+        self.assertTrue(any('fl:quick:SBH307' in str(p) for m,p in self.sent))
+        self.bot.handle(self.cb('fl:quick:SBH307'));rid=next(iter(self.db.rows))
+        self.bot.handle(self.cb('fl:CLEAR:'+rid))
+        self.assertTrue(any(p.get('reply_markup',{}).get('force_reply') for m,p in self.sent))
+        self.bot.handle(self.msg(photo=True,rid=rid));self.bot.handle(self.cb('fl:confirm:'+rid))
+        self.assertTrue(any('fl:next' in str(p) for m,p in self.sent))
+        self.bot.handle(self.cb('fl:next'));self.bot.handle(self.cb('fl:quick:SBH307'))
+        self.assertEqual(len(self.db.rows),2)
+        self.assertEqual(self.db.rows[rid]['data']['state'],'SENT')
+        self.assertEqual(sum(m=='sendPhoto' for m,p in self.sent),1)
+
+    def test_quick_selection_cannot_overwrite_existing_draft_or_grant_outlet(self):
+        rid=self.draft();before=copy.deepcopy(self.db.rows)
+        self.bot.handle(self.cb('fl:quick:SBH306'));self.assertEqual(before,self.db.rows)
+        self.bot.handle(self.cb('fl:quick:SBH307'));self.assertEqual(before,self.db.rows)
+        self.bot.handle(self.cb('fl:backdated'))
+        self.assertTrue(any('fl:outlet:SBH307' in str(p) for m,p in self.sent))
+
+    def test_channel_launcher_claim_pin_and_restarts_send_once(self):
+        storage={};original=self.db.api
+        def api(table,method='GET',data=None,params=None,prefer=None):
+            if table!='sgsb_sessions': return original(table,params)
+            if method=='GET': return [{'data':storage[params['key'][3:]]}] if params['key'][3:] in storage else []
+            if method=='POST':
+                if data['key'] in storage: return []
+                storage[data['key']]=data['data'];return [data]
+            storage[params['key'][3:]]=data['data'];return None
+        self.db.api=api
+        self.assertTrue(self.bot.publish_launcher());self.assertTrue(self.bot.publish_launcher())
+        posts=[p for m,p in self.sent if m=='sendMessage' and str(p['chat_id']).startswith('-100')]
+        self.assertEqual(len(posts),1);self.assertIn('?start=fleet',str(posts))
+        self.assertTrue(next(iter(storage.values()))['pinned'])
+
+    def test_ambiguous_launcher_is_not_posted_again(self):
+        storage={};original=self.db.api
+        def api(table,method='GET',data=None,params=None,prefer=None):
+            if method=='GET': return [{'data':v} for v in storage.values()]
+            if method=='POST': storage[data['key']]=data['data'];return [data]
+            storage[params['key'][3:]]=data['data'];return None
+        self.db.api=api;telegram=self.bot.telegram
+        self.bot.telegram=lambda m,p: {'ok':False,'ambiguous':True} if m=='sendMessage' else telegram(m,p)
+        self.assertFalse(self.bot.publish_launcher());self.assertFalse(self.bot.publish_launcher())
+        self.assertEqual(next(iter(storage.values()))['state'],'UNKNOWN')
+
 if __name__=='__main__': unittest.main()
