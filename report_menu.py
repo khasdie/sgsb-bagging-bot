@@ -25,7 +25,7 @@ class ReportMenu:
         menu=not cb and (command=='/menu' and len(parts)==1 or command=='/start' and parts[1:] in ([],['reports']))
         bagging=not cb and command=='/start' and parts[1:]==['bagging']
         if not menu and not bagging and data not in ('reports:menu','reports:bagging','reports:fleet'): return False
-        if cb: self.telegram('answerCallbackQuery',{'callback_query_id':cb['id']})
+        if cb and not cb.get('_btm_answered'): self.telegram('answerCallbackQuery',{'callback_query_id':cb['id']})
         if bagging or data=='reports:bagging': self.open_bagging(chat['id'],user)
         elif data=='reports:fleet': self.fleet.start(chat['id'],user,update['update_id'])
         else:

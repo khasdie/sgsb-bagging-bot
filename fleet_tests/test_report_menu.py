@@ -86,11 +86,14 @@ class MenuTests(unittest.TestCase):
         ns['open_bagging_from_menu'](8,8);self.assertEqual(calls[-1][0],'start')
 
     def test_real_webhook_auth_menu_bagging_and_duplicate_delivery(self):
-        sessions={};records={};done=set();sent=[];fleet=[]
+        sessions={};records={};done=set();sent=[];fleet=[];api_calls=[]
         db=types.ModuleType('storage_v5_1')
         db.RecordMap=lambda:records
         db.SessionMap=lambda name:sessions.setdefault(name,{})
-        db.api=lambda path,**kw:[{'code':'SBH307'}] if path=='sgsb_outlets' else []
+        def api(path,**kw):
+            api_calls.append(path)
+            return [{'code':'SBH307'}] if path=='sgsb_outlets' else []
+        db.api=api
         db.StorageError=RuntimeError;db.FRIENDLY='Synthetic storage error'
         def rpc(name,args):
             if name=='sgsb_claim_update': return 'done' if args['p_id'] in done else 'claimed'
@@ -98,22 +101,33 @@ class MenuTests(unittest.TestCase):
         db.rpc=rpc
         def post(url,json=None,**kwargs):
             self.assertTrue(url.startswith('https://api.telegram.org/botsynthetic-token/'))
-            sent.append(copy.deepcopy(json));return types.SimpleNamespace(json=lambda:{'ok':True,'result':{'message_id':42}})
+            sent.append((url.rsplit('/',1)[-1],copy.deepcopy(json)));return types.SimpleNamespace(json=lambda:{'ok':True,'result':{'message_id':42}})
         fake_fleet=types.SimpleNamespace(handle=lambda u:False,start=lambda *a:fleet.append(a))
         with patch.dict('sys.modules',{'storage_v5_1':db}),patch.dict(os.environ,{'BOT_TOKEN':'synthetic-token','WEBHOOK_SECRET':'synthetic-webhook','FLEET_ENABLED':'0','REPORT_MENU_CHANNELS':'0'}),patch('fleet_bot.install',return_value=fake_fleet),patch('requests.post',side_effect=post):
             spec=importlib.util.spec_from_file_location('isolated_menu_app',Path('app.py'))
             app=importlib.util.module_from_spec(spec);spec.loader.exec_module(app)
+            app.http_local.session=types.SimpleNamespace(post=post)
+            startup_outlet_reads=api_calls.count('sgsb_outlets')
+            self.assertGreaterEqual(startup_outlet_reads,1)
             client=app.app.test_client();header={'X-Telegram-Bot-Api-Secret-Token':'synthetic-webhook'}
             self.assertEqual(client.post('/webhook',json=self.msg('/start')).status_code,403)
             self.assertEqual(client.post('/webhook',json=self.msg('/start'),headers=header).status_code,200)
-            self.assertIn('SGSB REPORT MENU',sent[-1]['text']);self.assertEqual(records,{})
+            warm_outlet_reads=api_calls.count('sgsb_outlets')
+            self.assertLessEqual(warm_outlet_reads,startup_outlet_reads+1)
+            self.assertIn('SGSB REPORT MENU',sent[-1][1]['text']);self.assertEqual(records,{})
             self.assertEqual(client.post('/webhook',json=self.cb('reports:bagging'),headers=header).status_code,200)
             self.assertEqual(sessions['builder'][7]['step'],'outlet')
-            count=len(sent)
+            messages=sum(method=='sendMessage' for method,payload in sent)
             self.assertTrue(client.post('/webhook',json=self.cb('reports:bagging'),headers=header).json['duplicate'])
-            self.assertEqual(len(sent),count)
+            self.assertEqual(sum(method=='sendMessage' for method,payload in sent),messages)
             u=self.cb('reports:fleet');u['update_id']=7
             self.assertEqual(client.post('/webhook',json=u,headers=header).status_code,200)
             self.assertEqual(fleet,[(7,7,7)]);self.assertEqual(records,{})
+            self.assertLessEqual(api_calls.count('sgsb_outlets'),startup_outlet_reads+1)
+            self.assertIs(app.update_lock(self.msg('/start')),app.update_lock(self.cb('reports:fleet')))
+            other=self.msg('/start');other['message']['from']['id']=8;other['message']['chat']['id']=8
+            self.assertIsNot(app.update_lock(self.msg('/start')),app.update_lock(other))
+            callback_acks=[payload for method,payload in sent if method=='answerCallbackQuery']
+            self.assertGreaterEqual(len(callback_acks),3)
 
 if __name__=='__main__': unittest.main()

@@ -69,10 +69,28 @@ processed_updates = {}
 
 state_lock = threading.RLock()
 gist_lock = threading.RLock()
+update_locks = tuple(threading.RLock() for _ in range(64))
+http_local = threading.local()
 
 OUTLETS = list(DEFAULT_OUTLETS)
 OUTLET_STORAGE_OK = False
 OUTLET_STORAGE_ERROR = ""
+
+def http_session():
+    session = getattr(http_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        http_local.session = session
+    return session
+
+
+def update_lock(update):
+    callback = update.get("callback_query") or {}
+    message = callback.get("message") or update.get("message") or {}
+    actor = callback.get("from") or message.get("from") or {}
+    chat = message.get("chat") or {}
+    identity = actor.get("id") or chat.get("id") or update.get("update_id") or 0
+    return update_locks[int(identity) % len(update_locks)]
 
 # ============================================================
 # GENERAL HELPERS
@@ -202,7 +220,7 @@ def telegram(method, payload=None, timeout=30):
         return {"ok": False, "description": "BOT_TOKEN missing"}
 
     try:
-        response = requests.post(
+        response = http_session().post(
             f"{API}/{method}",
             json=payload or {},
             timeout=timeout
@@ -277,7 +295,7 @@ def send_media_group(chat_id, media):
 def send_document_file(chat_id, filepath, caption=""):
     try:
         with open(filepath, "rb") as f:
-            response = requests.post(
+            response = http_session().post(
                 f"{API}/sendDocument",
                 data={
                     "chat_id": str(chat_id),
@@ -295,7 +313,7 @@ def send_document_file(chat_id, filepath, caption=""):
 def send_photo_file(chat_id, filepath, caption=""):
     try:
         with open(filepath, "rb") as f:
-            response = requests.post(
+            response = http_session().post(
                 f"{API}/sendPhoto",
                 data={
                     "chat_id": str(chat_id),
@@ -351,6 +369,12 @@ def load_outlets_from_supabase():
         OUTLET_STORAGE_OK = False
         OUTLET_STORAGE_ERROR = db.FRIENDLY
         return False
+
+
+def ensure_outlets_available():
+    with state_lock:
+        ready = OUTLET_STORAGE_OK and bool(OUTLETS)
+    return ready or load_outlets_from_supabase()
 
 
 def save_outlets_to_supabase(outlets):
@@ -2029,7 +2053,8 @@ def handle_callback(callback):
     chat_id = message.get("chat", {}).get("id")
     data = callback.get("data", "")
 
-    answer_callback(callback_id)
+    if not callback.get("_btm_answered"):
+        answer_callback(callback_id)
 
     if data.startswith("media:"):
         parts = data.split(":")
@@ -2336,29 +2361,34 @@ def webhook():
     update = request.get_json(silent=True) or {}
     update_id=update.get('update_id')
     if not isinstance(update_id,int): return jsonify({'ok':False}),400
-    token=secrets.token_hex(16)
-    claimed=False
-    try:
-        claim=db.rpc('sgsb_claim_update',{'p_id':update_id,'p_token':token})
-        if claim=='done': return jsonify({'ok':True,'duplicate':True})
-        if claim!='claimed': return jsonify({'ok':False,'retry':True}),503
-        claimed=True
-        if not load_outlets_from_supabase(): raise db.StorageError(db.FRIENDLY)
-        if report_menu.handle(update): pass
-        elif fleet_bot.handle(update): pass
-        elif "message" in update: handle_message(update["message"])
-        elif "callback_query" in update: handle_callback(update["callback_query"])
-        db.rpc('sgsb_finish_update',{'p_id':update_id,'p_token':token,'p_done':True})
-        return jsonify({'ok':True})
-    except Exception as e:
-        print('Webhook processing failed:',type(e).__name__,flush=True)
-        if claimed:
-            try: db.rpc('sgsb_finish_update',{'p_id':update_id,'p_token':token,'p_done':False})
-            except db.StorageError: pass
-        msg=update.get('message') or update.get('callback_query',{}).get('message',{})
-        chat_id=msg.get('chat',{}).get('id')
-        if chat_id: send_message(chat_id,'⚠️ '+db.FRIENDLY)
-        return jsonify({'ok':False,'retry':True}),503
+    with update_lock(update):
+        callback=update.get('callback_query') or {}
+        if callback.get('id'):
+            acknowledged=answer_callback(callback['id'])
+            if acknowledged.get('ok'): callback['_btm_answered']=True
+        token=secrets.token_hex(16)
+        claimed=False
+        try:
+            claim=db.rpc('sgsb_claim_update',{'p_id':update_id,'p_token':token})
+            if claim=='done': return jsonify({'ok':True,'duplicate':True})
+            if claim!='claimed': return jsonify({'ok':False,'retry':True}),503
+            claimed=True
+            if not ensure_outlets_available(): raise db.StorageError(db.FRIENDLY)
+            if report_menu.handle(update): pass
+            elif fleet_bot.handle(update): pass
+            elif "message" in update: handle_message(update["message"])
+            elif "callback_query" in update: handle_callback(update["callback_query"])
+            db.rpc('sgsb_finish_update',{'p_id':update_id,'p_token':token,'p_done':True})
+            return jsonify({'ok':True})
+        except Exception as e:
+            print('Webhook processing failed:',type(e).__name__,flush=True)
+            if claimed:
+                try: db.rpc('sgsb_finish_update',{'p_id':update_id,'p_token':token,'p_done':False})
+                except db.StorageError: pass
+            msg=update.get('message') or update.get('callback_query',{}).get('message',{})
+            chat_id=msg.get('chat',{}).get('id')
+            if chat_id: send_message(chat_id,'⚠️ '+db.FRIENDLY)
+            return jsonify({'ok':False,'retry':True}),503
 
 # ============================================================
 # STARTUP

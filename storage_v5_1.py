@@ -1,6 +1,7 @@
 """Server-only Supabase storage. No Gist or local persistence fallback."""
 import os
 import requests
+import threading
 from collections.abc import MutableMapping
 from datetime import datetime, timezone, timedelta
 
@@ -10,6 +11,15 @@ class StorageError(RuntimeError):
 class DuplicateRecord(StorageError):
     pass
 
+_http_local = threading.local()
+
+def _http():
+    session = getattr(_http_local, 'session', None)
+    if session is None:
+        session = requests.Session()
+        _http_local.session = session
+    return session
+
 def api(path, method='GET', data=None, params=None, prefer=None):
     url=os.environ.get('SUPABASE_URL','').rstrip('/')
     key=os.environ.get('SUPABASE_SECRET_KEY','')
@@ -17,7 +27,7 @@ def api(path, method='GET', data=None, params=None, prefer=None):
     headers={'apikey':key, 'Content-Type':'application/json'}
     if prefer: headers['Prefer']=prefer
     try:
-        r=requests.request(method,url+'/rest/v1/'+path,headers=headers,json=data,params=params,timeout=25)
+        r=_http().request(method,url+'/rest/v1/'+path,headers=headers,json=data,params=params,timeout=25)
         if r.status_code==409: raise DuplicateRecord('Rekod Outlet + Seal + Tarikh sudah wujud.')
         if not r.ok:
             print('Supabase request failed:',path.split('?')[0],r.status_code,flush=True)

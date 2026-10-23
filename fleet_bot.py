@@ -210,7 +210,7 @@ class FleetBot:
         session=self.sessions.get(user)
         # Never steal Bagging photos or remark replies, even with a Fleet draft.
         try:
-            if cb: self.telegram('answerCallbackQuery',{'callback_query_id':cb['id']})
+            if cb and not cb.get('_btm_answered'): self.telegram('answerCallbackQuery',{'callback_query_id':cb['id']})
             if command=='/fleet_id':
                 self.send(chat,'Your Telegram ID: <code>'+str(user)+'</code>\nThis identifies your own Telegram account; it does not grant access or change your role.');return True
             if command=='/fleet_access':
